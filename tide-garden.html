@@ -69,6 +69,7 @@ const size = width * height;
 const image = ctx.createImageData(width, height);
 const pixels = new Uint32Array(image.data.buffer);
 const terrain = new Float32Array(size);
+const targetTerrain = new Float32Array(size);
 const relief = new Float32Array(size);
 const texture = new Float32Array(size);
 const flecks = new Float32Array(size);
@@ -78,6 +79,12 @@ const radius = 69;
 const radiusSquared = radius * radius;
 const startPositions = [[84, 93], [152, 115], [263, 72], [296, 147]];
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+function smoothstep(min, max, value) {
+  const t = clamp((value - min) / (max - min), 0, 1);
+  return t * t * (3 - 2 * t);
+}
 
 // Fixed world-coordinate noise holds coast detail and prop positions steady during a drag.
 function hash(x, y, salt = 0) {
@@ -132,10 +139,10 @@ const sparkleColor = color('6eb7a7');
 const darkGrain = color('729353');
 const sandGrain = color('cda775');
 
-// Original sprites. A dot is transparent. The last row is the ground contact line.
+// A dot is transparent. The last row is the ground contact line.
 const spritePalette = {
   s:'#345d4c', d:'#2d5745', g:'#467451', l:'#709858', h:'#a1b068',
-  t:'#745747', r:'#786d64', m:'#a59a83', w:'#c5b69a', f:'#e8c27d'
+  t:'#745747', o:'#726552', r:'#867960', m:'#aaa087', w:'#cfc09b', f:'#e8c27d'
 };
 const sprites = {
   pine: ['....l....','...ll....','...lgd...','..llgdd..','...ggd...',
@@ -144,7 +151,13 @@ const sprites = {
          '.lggdd.','llggdds','.ggdss.','...tss.'],
   rock: ['..wm..','.wwmr.','wwmmrr','.mmrrs','..sss.'],
   bush: ['..hg...','.hggl..','hhgggds','.ggdds.'],
-  flower: ['.f...','hl.f.','.g.hl','...g.']
+  flower: ['.f...','hl.f.','.g.hl','...g.'],
+  // Cropped and recolored from Mini Meadow by myobln (CC0).
+  thicket: ['.sssssss.','ssgghlls.','sggglllss','sgggllgds','sgggggdds',
+            'sdgggddds','sddddddds','ssdddddss','.sssssss.'],
+  boulder: ['.ooooo.....','oowmmooo...','ommmmmwooo.','ommmllrrroo','ommmmmrrrro',
+            'oommmmmrrro','.ooommmrroo','...ommmooo.','...ooooo...'],
+  pebbles: ['.ooo.oooo..','oomooowwo..','ommmoowwooo','oommoooorro','.oooo..orro','.......oooo']
 };
 
 function makeSprite(rows) {
@@ -162,15 +175,26 @@ function makeSprite(rows) {
 
 const atlas = Object.fromEntries(Object.entries(sprites).map(([name, rows]) => [name, makeSprite(rows)]));
 const props = [];
+const placement = {
+  pine: .61, fir: .61, thicket: .66, bush: .55,
+  flower: .55, rock: .42, boulder: .64, pebbles: .40
+};
 for (let y = 12; y < height - 6; y += 10) {
   for (let x = 6; x < width - 6; x += 10) {
     const chance = hash(x, y, 19);
-    if (chance > .73) continue;
+    const grove = noise(x / 28, y / 28, 93);
+    const variant = hash(x, y, 71);
+    if (chance > .68) continue;
+    const kind = chance < .34 && grove > .37 ? (chance < .19 ? 'pine' : 'fir') :
+                 chance < .46 ? (variant < .36 ? 'thicket' : 'bush') :
+                 chance < .58 ? 'flower' :
+                 chance < .63 ? (variant < .27 ? 'boulder' : 'rock') : 'pebbles';
     props.push({
       x: x + Math.floor(hash(x, y, 21) * 9) - 4,
       y: y + Math.floor(hash(x, y, 33) * 9) - 4,
-      kind: chance < .22 ? 'pine' : chance < .37 ? 'fir' :
-            chance < .49 ? 'bush' : chance < .62 ? 'rock' : 'flower'
+      kind,
+      landLevel: placement[kind],
+      opacity: 0
     });
   }
 }
@@ -180,11 +204,14 @@ let anchors = [];
 let selected = null;
 let nextId = 1;
 let drag = null;
-let dirty = true;
+let terrainDirty = true;
+let viewDirty = true;
+let morphing = false;
+let fading = false;
 
 // Compact radial contributions form a continuous field and naturally join nearby islands.
 function computeTerrain() {
-  terrain.set(relief);
+  targetTerrain.set(relief);
   for (const { x, y } of anchors) {
     const x0 = Math.max(0, Math.floor(x - radius));
     const x1 = Math.min(width - 1, Math.ceil(x + radius));
@@ -194,10 +221,48 @@ function computeTerrain() {
       const dy = (row - y) ** 2;
       for (let col = x0; col <= x1; col++) {
         const slope = 1 - ((col - x) ** 2 + dy) / radiusSquared;
-        if (slope > 0) terrain[row * width + col] += slope ** 3;
+        if (slope > 0) targetTerrain[row * width + col] += slope ** 3;
       }
     }
   }
+}
+
+function advanceTerrain(elapsed, immediate) {
+  const blend = immediate ? 1 : 1 - Math.exp(-elapsed / 83);
+  let moving = false;
+  for (let i = 0; i < size; i++) {
+    const difference = targetTerrain[i] - terrain[i];
+    if (immediate || Math.abs(difference) < .002) {
+      terrain[i] = targetTerrain[i];
+    } else {
+      terrain[i] += difference * blend;
+      moving = true;
+    }
+  }
+  return moving;
+}
+
+function advanceProps(elapsed, immediate) {
+  let moving = false;
+  for (const prop of props) {
+    const { x, y, landLevel, opacity } = prop;
+    const level = terrain[y * width + x];
+    let handleDistance = Infinity;
+    for (const anchor of anchors) {
+      handleDistance = Math.min(handleDistance, Math.hypot(anchor.x - x, anchor.y - y));
+    }
+    const targetOpacity = smoothstep(landLevel - .035, landLevel + .06, level)
+      * smoothstep(9, 17, handleDistance);
+    const difference = targetOpacity - opacity;
+    if (immediate || Math.abs(difference) < .01) {
+      prop.opacity = targetOpacity;
+    } else {
+      const duration = difference > 0 ? 110 : 75;
+      prop.opacity += difference * (1 - Math.exp(-elapsed / duration));
+      moving = true;
+    }
+  }
+  return moving;
 }
 
 function renderTerrain(phase) {
@@ -209,7 +274,9 @@ function renderTerrain(phase) {
         pixels[i] = debugPalette[clamp(Math.floor((level + .2) * 42), 0, 63)];
         continue;
       }
-      const band = bands.find(({ limit }) => level < limit);
+      let bandIndex = 0;
+      while (level >= bands[bandIndex].limit) bandIndex++;
+      const band = bands[bandIndex];
       const grain = flecks[i];
       let pixel = texture[i] + grain * .17 > .56 ? band.light : band.dark;
       if (level > .53 && grain > .968) pixel = darkGrain;
@@ -221,14 +288,14 @@ function renderTerrain(phase) {
   }
   ctx.putImageData(image, 0, 0);
   if (showField) return;
-  for (const prop of props) {
-    const { x, y, kind } = prop;
-    const level = terrain[y * width + x];
-    const threshold = kind === 'rock' ? .43 : .56;
-    if (level < threshold || anchors.some(anchor => Math.hypot(anchor.x - x, anchor.y - y) < 13)) continue;
+  for (const { x, y, kind, opacity } of props) {
+    const visibleOpacity = opacity * smoothstep(.32, .42, terrain[y * width + x]);
+    if (visibleOpacity < .01) continue;
     const sprite = atlas[kind];
+    ctx.globalAlpha = visibleOpacity;
     ctx.drawImage(sprite, x - Math.floor(sprite.width / 2), y - sprite.height + 1);
   }
+  ctx.globalAlpha = 1;
 }
 
 function syncControls() {
@@ -247,7 +314,7 @@ function position(anchor, x, y) {
   anchor.y = clamp(y, marginY, height - marginY);
   anchor.button.style.left = anchor.x / width * 100 + '%';
   anchor.button.style.top = anchor.y / height * 100 + '%';
-  dirty = true;
+  terrainDirty = true;
 }
 
 function addAnchor(x, y) {
@@ -306,7 +373,7 @@ function deleteAnchor(anchor) {
   selected = anchors[Math.min(index, anchors.length - 1)] ?? null;
   syncControls();
   if (restoreFocus) (selected?.button ?? addButton).focus();
-  dirty = true;
+  terrainDirty = true;
 }
 
 stage.addEventListener('pointermove', event => {
@@ -333,7 +400,7 @@ fieldButton.addEventListener('click', () => {
   const active = fieldButton.getAttribute('aria-pressed') !== 'true';
   fieldButton.setAttribute('aria-pressed', String(active));
   legend.style.display = active ? 'none' : '';
-  dirty = true;
+  viewDirty = true;
 });
 function reset() {
   for (const anchor of anchors) anchor.button.remove();
@@ -350,16 +417,27 @@ new ResizeObserver(() => {
 }).observe(stage);
 
 function frame(time) {
+  const firstFrame = lastTime === undefined;
+  const elapsed = firstFrame ? 0 : Math.min(time - lastTime, 50);
+  const immediate = firstFrame || reducedMotion.matches;
   const phase = Math.floor(time / 150);
   const animated = fieldButton.getAttribute('aria-pressed') !== 'true'
-    && !matchMedia('(prefers-reduced-motion: reduce)').matches;
-  if (dirty) computeTerrain();
-  if (dirty || (animated && phase !== lastPhase)) renderTerrain(animated ? phase : 0);
-  dirty = false;
-  lastPhase = phase;
+    && !reducedMotion.matches;
+  if (terrainDirty) computeTerrain();
+  const terrainChanged = terrainDirty || morphing;
+  const propsChanged = terrainChanged || fading;
+  if (terrainChanged) morphing = advanceTerrain(elapsed, immediate);
+  if (propsChanged) fading = advanceProps(elapsed, immediate);
+  const renderPhase = animated ? phase : 0;
+  if (viewDirty || terrainChanged || propsChanged || renderPhase !== lastPhase) renderTerrain(renderPhase);
+  terrainDirty = false;
+  viewDirty = false;
+  lastTime = time;
+  lastPhase = renderPhase;
   requestAnimationFrame(frame);
 }
 let lastPhase = -1;
+let lastTime;
 reset();
 requestAnimationFrame(frame);
 </script>

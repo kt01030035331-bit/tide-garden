@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>潮汐群岛 · 程序化地图</title>
+<style>
+*{box-sizing:border-box}
+:root{color-scheme:dark;font:15px/1.5 system-ui,"Microsoft YaHei",sans-serif;background:#101c20;color:#edf0e4}
+body{margin:0;padding:40px 22px 32px}
+main{max-width:1120px;margin:auto}
+header,.toolbar,.bar,.legend{display:flex;align-items:center;gap:12px}
+header{justify-content:space-between;align-items:end;flex-wrap:wrap;margin-bottom:20px}
+h1{margin:0;font-size:clamp(30px,5vw,44px);letter-spacing:.06em;font-weight:700}
+p{margin:5px 0 0;color:#a6bab7}
+.toolbar{flex-wrap:wrap;gap:8px}
+button{cursor:pointer;color:inherit;font:inherit;padding:7px 12px;border:1px solid #41575a;background:#1c3034;border-radius:6px}
+button:hover,button[aria-pressed=true]{background:#315057}
+button:focus-visible,.anchor:focus-visible{outline:2px solid #fff4c5;outline-offset:3px}
+button:disabled{opacity:.44;cursor:default}
+.board{overflow:hidden;border:1px solid #43585a;border-radius:12px;background:#15282d}
+.stage{position:relative;aspect-ratio:12/7;touch-action:none;background:#174a57;overflow:hidden}
+canvas{width:100%;height:100%;display:block;image-rendering:pixelated}
+.anchor{position:absolute;transform:translate(-50%,-50%);width:34px;height:34px;padding:0;border:1px solid #d6e0c5;background:#172d2e;color:#f9f3d7;font:700 14px/1 monospace;box-shadow:0 3px 0 #172d2e80;cursor:grab;user-select:none}
+.anchor[aria-pressed=true]{background:#fff0bf;color:#203236;border-color:#28393a}
+.anchor:active{cursor:grabbing}
+.bar{justify-content:space-between;flex-wrap:wrap;padding:10px 15px;font-size:13px;color:#b9cac5}
+.legend{flex-wrap:wrap;gap:14px}
+.legend span::before{content:"";display:inline-block;width:8px;height:8px;margin-right:5px;background:var(--sample);border-radius:2px}
+@media(max-width:520px){body{padding:20px 12px}.anchor{width:29px;height:29px}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div><h1>潮汐群岛</h1><p>拖动地图上的编号，让岛屿合并或分开。</p></div>
+  <div class="toolbar">
+    <button id="add" type="button">添加锚点</button>
+    <button id="remove" type="button" disabled>删除选中</button>
+    <button id="field" type="button" aria-pressed="false">地形场</button>
+    <button id="reset" type="button">重置</button>
+  </div>
+</header>
+<div class="board">
+  <div class="stage" id="stage" role="group" aria-label="地形锚点，支持方向键移动">
+    <canvas id="map" width="384" height="224" role="img" aria-label="随锚点实时变化的像素海岛地图"></canvas>
+  </div>
+  <div class="bar">
+    <div class="legend" id="legend"><span style="--sample:#205766">深海</span><span style="--sample:#53a796">浅海</span><span style="--sample:#ebca8d">沙滩</span><span style="--sample:#91ad6b">草地</span></div>
+    <span id="count" role="status"></span>
+  </div>
+</div>
+</main>
+<script>
+'use strict';
+
+const canvas = document.querySelector('#map');
+const stage = document.querySelector('#stage');
+const addButton = document.querySelector('#add');
+const removeButton = document.querySelector('#remove');
+const resetButton = document.querySelector('#reset');
+const fieldButton = document.querySelector('#field');
+const count = document.querySelector('#count');
+const legend = document.querySelector('#legend');
+const ctx = canvas.getContext('2d');
+const width = canvas.width;
+const height = canvas.height;
+const size = width * height;
+const image = ctx.createImageData(width, height);
+const pixels = new Uint32Array(image.data.buffer);
+const terrain = new Float32Array(size);
+const relief = new Float32Array(size);
+const texture = new Float32Array(size);
+const flecks = new Float32Array(size);
+const isLittleEndian = new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
+const maxAnchors = 9;
+const radius = 69;
+const radiusSquared = radius * radius;
+const startPositions = [[84, 93], [152, 115], [263, 72], [296, 147]];
+const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+// Fixed world-coordinate noise holds coast detail and prop positions steady during a drag.
+function hash(x, y, salt = 0) {
+  let n = Math.imul(x + salt, 374761393) ^ Math.imul(y - salt, 668265263);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+
+function noise(x, y, salt) {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  let u = x - ix;
+  let v = y - iy;
+  u = u * u * (3 - 2 * u);
+  v = v * v * (3 - 2 * v);
+  const top = hash(ix, iy, salt) * (1 - u) + hash(ix + 1, iy, salt) * u;
+  const bottom = hash(ix, iy + 1, salt) * (1 - u) + hash(ix + 1, iy + 1, salt) * u;
+  return top * (1 - v) + bottom * v;
+}
+
+for (let y = 0, i = 0; y < height; y++) {
+  for (let x = 0; x < width; x++, i++) {
+    relief[i] = (noise(x / 22, y / 22, 41) - .5) * .32
+      + (noise(x / 8, y / 8, 58) - .5) * .11;
+    texture[i] = noise(x / 14, y / 10, 77);
+    flecks[i] = hash(x, y, 12);
+  }
+}
+
+function color(hex) {
+  const rgb = Number.parseInt(hex, 16);
+  if (!isLittleEndian) return ((rgb << 8) | 255) >>> 0;
+  return (0xff000000 | (rgb >>> 16) | (rgb & 0xff00) | ((rgb & 255) << 16)) >>> 0;
+}
+
+const bands = [
+  [-.04, '194956', '205462'], [.048, '265f6b', '2b6d76'],
+  [.144, '347d7e', '3a8a86'], [.237, '459389', '54a695'],
+  [.301, '75bba0', '86c7a8'], [.321, 'c0dfb9', 'd0e6bc'],
+  [.347, 'bd956e', 'cda77a'], [.48, 'e0bb83', 'ebca8d'],
+  [.525, 'a5ad71', 'b4b67a'], [.93, '84a060', '93ad6d'],
+  [Infinity, '749453', '85a262']
+].map(([limit, dark, light]) => ({ limit, dark: color(dark), light: color(light) }));
+const debugPalette = Array.from({ length: 64 }, (_, i) => {
+  const red = i * 4;
+  const green = 38 + i * 3;
+  const blue = 52 + i;
+  return color(((red << 16) | (green << 8) | blue).toString(16));
+});
+const waveColor = color('34717b');
+const sparkleColor = color('6eb7a7');
+const darkGrain = color('729353');
+const sandGrain = color('cda775');
+
+// Original sprites. A dot is transparent. The last row is the ground contact line.
+const spritePalette = {
+  s:'#345d4c', d:'#2d5745', g:'#467451', l:'#709858', h:'#a1b068',
+  t:'#745747', r:'#786d64', m:'#a59a83', w:'#c5b69a', f:'#e8c27d'
+};
+const sprites = {
+  pine: ['....l....','...ll....','...lgd...','..llgdd..','...ggd...',
+         '..llgdd..','.hllggdd.','..gggdd..','.llgggdd.','llggggdds','.dggddss.','....tss..'],
+  fir:  ['...l...','...g...','..lgd..','..ggd..','.llgdd.','..ggd..',
+         '.lggdd.','llggdds','.ggdss.','...tss.'],
+  rock: ['..wm..','.wwmr.','wwmmrr','.mmrrs','..sss.'],
+  bush: ['..hg...','.hggl..','hhgggds','.ggdds.'],
+  flower: ['.f...','hl.f.','.g.hl','...g.']
+};
+
+function makeSprite(rows) {
+  const tile = document.createElement('canvas');
+  tile.width = rows[0].length;
+  tile.height = rows.length;
+  const brush = tile.getContext('2d');
+  rows.forEach((row, y) => Array.from(row).forEach((key, x) => {
+    if (key === '.') return;
+    brush.fillStyle = spritePalette[key];
+    brush.fillRect(x, y, 1, 1);
+  }));
+  return tile;
+}
+
+const atlas = Object.fromEntries(Object.entries(sprites).map(([name, rows]) => [name, makeSprite(rows)]));
+const props = [];
+for (let y = 12; y < height - 6; y += 10) {
+  for (let x = 6; x < width - 6; x += 10) {
+    const chance = hash(x, y, 19);
+    if (chance > .73) continue;
+    props.push({
+      x: x + Math.floor(hash(x, y, 21) * 9) - 4,
+      y: y + Math.floor(hash(x, y, 33) * 9) - 4,
+      kind: chance < .22 ? 'pine' : chance < .37 ? 'fir' :
+            chance < .49 ? 'bush' : chance < .62 ? 'rock' : 'flower'
+    });
+  }
+}
+props.sort((a, b) => a.y - b.y);
+
+let anchors = [];
+let selected = null;
+let nextId = 1;
+let drag = null;
+let dirty = true;
+
+// Compact radial contributions form a continuous field and naturally join nearby islands.
+function computeTerrain() {
+  terrain.set(relief);
+  for (const { x, y } of anchors) {
+    const x0 = Math.max(0, Math.floor(x - radius));
+    const x1 = Math.min(width - 1, Math.ceil(x + radius));
+    const y0 = Math.max(0, Math.floor(y - radius));
+    const y1 = Math.min(height - 1, Math.ceil(y + radius));
+    for (let row = y0; row <= y1; row++) {
+      const dy = (row - y) ** 2;
+      for (let col = x0; col <= x1; col++) {
+        const slope = 1 - ((col - x) ** 2 + dy) / radiusSquared;
+        if (slope > 0) terrain[row * width + col] += slope ** 3;
+      }
+    }
+  }
+}
+
+function renderTerrain(phase) {
+  const showField = fieldButton.getAttribute('aria-pressed') === 'true';
+  for (let y = 0, i = 0; y < height; y++) {
+    for (let x = 0; x < width; x++, i++) {
+      const level = terrain[i];
+      if (showField) {
+        pixels[i] = debugPalette[clamp(Math.floor((level + .2) * 42), 0, 63)];
+        continue;
+      }
+      const band = bands.find(({ limit }) => level < limit);
+      const grain = flecks[i];
+      let pixel = texture[i] + grain * .17 > .56 ? band.light : band.dark;
+      if (level > .53 && grain > .968) pixel = darkGrain;
+      if (level > .35 && level < .48 && grain > .973) pixel = sandGrain;
+      if (level < .22 && grain > .76 && texture[i] > .69 && (x + y * 3 + phase) % 23 < 3) pixel = waveColor;
+      if (level > .19 && level < .3 && grain > .92 && (x + phase) % 11 < 6) pixel = sparkleColor;
+      pixels[i] = pixel;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  if (showField) return;
+  for (const prop of props) {
+    const { x, y, kind } = prop;
+    const level = terrain[y * width + x];
+    const threshold = kind === 'rock' ? .43 : .56;
+    if (level < threshold || anchors.some(anchor => Math.hypot(anchor.x - x, anchor.y - y) < 13)) continue;
+    const sprite = atlas[kind];
+    ctx.drawImage(sprite, x - Math.floor(sprite.width / 2), y - sprite.height + 1);
+  }
+}
+
+function syncControls() {
+  for (const anchor of anchors) anchor.button.setAttribute('aria-pressed', String(anchor === selected));
+  addButton.disabled = anchors.length >= maxAnchors;
+  removeButton.disabled = selected === null;
+  count.textContent = anchors.length + ' 个锚点';
+}
+
+function position(anchor, x, y) {
+  // Convert the button margin to map units so its handle stays accessible on narrow screens.
+  const rect = stage.getBoundingClientRect();
+  const marginX = Math.min(width / 2, 18 * width / Math.max(1, rect.width));
+  const marginY = Math.min(height / 2, 18 * height / Math.max(1, rect.height));
+  anchor.x = clamp(x, marginX, width - marginX);
+  anchor.y = clamp(y, marginY, height - marginY);
+  anchor.button.style.left = anchor.x / width * 100 + '%';
+  anchor.button.style.top = anchor.y / height * 100 + '%';
+  dirty = true;
+}
+
+function addAnchor(x, y) {
+  const button = document.createElement('button');
+  const id = nextId++;
+  button.type = 'button';
+  button.className = 'anchor';
+  button.textContent = String(id);
+  button.setAttribute('aria-label', '地形锚点 ' + id);
+  const anchor = { x, y, button };
+  anchors.push(anchor);
+  stage.append(button);
+  position(anchor, x, y);
+  button.addEventListener('click', () => {
+    selected = anchor;
+    syncControls();
+  });
+  button.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || drag) return;
+    const point = pointerPosition(event);
+    selected = anchor;
+    drag = { anchor, pointerId: event.pointerId, dx: anchor.x - point.x, dy: anchor.y - point.y };
+    button.setPointerCapture(event.pointerId);
+    syncControls();
+  });
+  button.addEventListener('keydown', event => {
+    const step = event.shiftKey ? 12 : 3;
+    const offsets = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+    if (event.key === 'Delete') {
+      event.preventDefault();
+      deleteAnchor(anchor);
+    } else if (Object.hasOwn(offsets, event.key)) {
+      event.preventDefault();
+      const [dx, dy] = offsets[event.key];
+      selected = anchor;
+      position(anchor, anchor.x + dx, anchor.y + dy);
+      syncControls();
+    }
+  });
+  return anchor;
+}
+
+function pointerPosition(event) {
+  const rect = stage.getBoundingClientRect();
+  return { x: (event.clientX - rect.left) * width / rect.width,
+           y: (event.clientY - rect.top) * height / rect.height };
+}
+
+function deleteAnchor(anchor) {
+  const index = anchors.indexOf(anchor);
+  if (index === -1) return;
+  const restoreFocus = document.activeElement === anchor.button || document.activeElement === removeButton;
+  if (drag?.anchor === anchor) drag = null;
+  anchor.button.remove();
+  anchors.splice(index, 1);
+  selected = anchors[Math.min(index, anchors.length - 1)] ?? null;
+  syncControls();
+  if (restoreFocus) (selected?.button ?? addButton).focus();
+  dirty = true;
+}
+
+stage.addEventListener('pointermove', event => {
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  const point = pointerPosition(event);
+  position(drag.anchor, point.x + drag.dx, point.y + drag.dy);
+});
+for (const eventName of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+  stage.addEventListener(eventName, event => {
+    if (event.pointerId === drag?.pointerId) drag = null;
+  });
+}
+addButton.addEventListener('click', () => {
+  if (anchors.length >= maxAnchors) return;
+  const options = [[190, 73], [201, 155], [80, 153], [298, 102], [190, 114]];
+  const distance = ([x, y]) => Math.min(...anchors.map(anchor => Math.hypot(anchor.x - x, anchor.y - y)));
+  options.sort((a, b) => distance(b) - distance(a));
+  selected = addAnchor(...options[0]);
+  syncControls();
+  selected.button.focus();
+});
+removeButton.addEventListener('click', () => { if (selected) deleteAnchor(selected); });
+fieldButton.addEventListener('click', () => {
+  const active = fieldButton.getAttribute('aria-pressed') !== 'true';
+  fieldButton.setAttribute('aria-pressed', String(active));
+  legend.style.display = active ? 'none' : '';
+  dirty = true;
+});
+function reset() {
+  for (const anchor of anchors) anchor.button.remove();
+  anchors = [];
+  selected = null;
+  nextId = 1;
+  drag = null;
+  for (const [x, y] of startPositions) addAnchor(x, y);
+  syncControls();
+}
+resetButton.addEventListener('click', reset);
+new ResizeObserver(() => {
+  for (const anchor of anchors) position(anchor, anchor.x, anchor.y);
+}).observe(stage);
+
+function frame(time) {
+  const phase = Math.floor(time / 150);
+  const animated = fieldButton.getAttribute('aria-pressed') !== 'true'
+    && !matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (dirty) computeTerrain();
+  if (dirty || (animated && phase !== lastPhase)) renderTerrain(animated ? phase : 0);
+  dirty = false;
+  lastPhase = phase;
+  requestAnimationFrame(frame);
+}
+let lastPhase = -1;
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
